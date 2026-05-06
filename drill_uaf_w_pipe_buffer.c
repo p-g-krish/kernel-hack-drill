@@ -133,7 +133,8 @@ int act(int act_fd, int code, int n, char *args)
 #define CPU_PARTIAL_SLABS 6
 #define HOLES 450
 
-/* Perform a cross-cache attack:
+/*
+ * Perform a cross-cache attack:
  *  - pin the process to a single CPU
  *  - plug the holes in the initial slab cache
  *  - plug the holes in the final slab cache
