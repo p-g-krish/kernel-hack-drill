@@ -1,5 +1,7 @@
 # Linux kernel exploitation experiments
 
+[![static analysis](https://github.com/a13xp0p0v/kernel-hack-drill/workflows/code%20style%20check/badge.svg)](https://github.com/a13xp0p0v/kernel-hack-drill/actions/workflows/code_style_check.yml)
+
 This is a playground for the Linux kernel exploitation experiments.
 Only basic methods. Just for fun.
 
