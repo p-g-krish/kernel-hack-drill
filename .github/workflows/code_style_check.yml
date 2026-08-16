@@ -13,7 +13,7 @@ jobs:
     steps:
 
     - name: Get the source code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install dependencies
       run: |
@@ -44,7 +44,7 @@ jobs:
 
     - name: Upload style.patch on failure
       if: failure()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: style.patch
         path: style.patch
